@@ -1,0 +1,273 @@
+package fcli //nolint:revive
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/signal"
+	"regexp"
+	"runtime/debug"
+	"sync"
+	"time"
+
+	fslock "github.com/ipfs/go-fs-lock"
+	logging "github.com/ipfs/go-log/v2"
+	"github.com/mattn/go-isatty"
+	"github.com/prometheus/client_golang/prometheus"
+	prometheuspush "github.com/prometheus/client_golang/prometheus/push"
+	"github.com/ribasushi/go-toolbox/cmn"
+	"github.com/urfave/cli/v2"
+	"github.com/urfave/cli/v2/altsrc"
+	"golang.org/x/sys/unix"
+)
+
+type prometheusPushCfg struct {
+	url      string
+	user     string
+	pass     string
+	instance string
+}
+
+// nolint:revive
+type Logger = *logging.ZapEventLogger // FIXME make it an actual interface
+
+// Fcli is a urfavecli/v2/cli.App wrapper with simplified error and signal
+// handling. It also provides correct init/shutdown hookpoints, and proper
+// locking preventing the same app/command from running more than once.
+type Fcli struct {
+	AppConfig      cli.App                                                            // stock urfavecli App configuration
+	TOMLPath       string                                                             // path of TOML config file read via https://pkg.go.dev/github.com/urfave/cli/v2/altsrc
+	GlobalInit     func(cctx *cli.Context, f Fcli) (resourceCloser func(), err error) // optional initialization routines (setup RDBMS pool, etc)
+	BeforeShutdown func()                                                             // optional function to execute before the top context is cancelled ( unlike resourceCloser above )
+	Logger         Logger
+}
+
+var baseFlags = []cli.Flag{
+	altsrc.NewStringFlag(&cli.StringFlag{
+		Name:        "prometheus_push_url",
+		DefaultText: "  {{ private, read from config file }}  ",
+		Hidden:      true,
+	}),
+	altsrc.NewStringFlag(&cli.StringFlag{
+		Name:        "prometheus_push_user",
+		DefaultText: "  {{ private, read from config file }}  ",
+		Hidden:      true,
+	}),
+	altsrc.NewStringFlag(&cli.StringFlag{
+		Name:        "prometheus_push_pass",
+		DefaultText: "  {{ private, read from config file }}  ",
+		Hidden:      true,
+	}),
+	altsrc.NewStringFlag(&cli.StringFlag{
+		Name:        "prometheus_instance",
+		DefaultText: "  {{ private, read from config file }}  ",
+		Hidden:      true,
+	}),
+}
+
+// RunAndExit will excute any init routines, run the app, and os.Exit() after shutdown
+func (f Fcli) RunAndExit(parentCtx context.Context) {
+	ctx, topCtxShutdown := context.WithCancel(parentCtx)
+
+	var resourcesCloser func()
+	var o sync.Once
+	// called from the defer below
+	shutdown := func(isNormal bool) {
+		o.Do(func() {
+
+			if f.BeforeShutdown != nil {
+				f.BeforeShutdown()
+			}
+
+			topCtxShutdown()
+
+			if resourcesCloser != nil {
+				resourcesCloser()
+			}
+
+			if !isNormal {
+				time.Sleep(250 * time.Millisecond) // give a bit of extra time for various parts to close
+			}
+		})
+	}
+
+	go func() {
+		sigs := make(chan os.Signal, 1)
+		signal.Notify(sigs, unix.SIGINT, unix.SIGTERM)
+		<-sigs
+		f.Logger.Warn("termination signal received, cleaning up...")
+		shutdown(false)
+	}()
+
+	// BIZARRE inverted flow because... scoping
+	var (
+		startTime      time.Time
+		err            error
+		currentCmd     string
+		currentCmdLock io.Closer
+		ppc            prometheusPushCfg
+	)
+	emitEndLogs := func(wasSuccess bool) {
+		took := time.Since(startTime).Truncate(time.Millisecond)
+		logHdr := fmt.Sprintf("=== FINISH '%s' run", currentCmd)
+		logArgs := []interface{}{
+			"success", wasSuccess,
+			"took", took.String(),
+		}
+
+		cmdFqName := promStr(f.AppConfig.Name + "_" + currentCmd)
+		tookGauge := prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: fmt.Sprintf("%s_run_time", cmdFqName),
+			Help: "How long did the job take (in milliseconds)",
+		})
+		tookGauge.Set(float64(took.Milliseconds()))
+		successGauge := prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: fmt.Sprintf("%s_success", cmdFqName),
+			Help: "Whether the job completed with success(1) or failure(0)",
+		})
+
+		if wasSuccess {
+			f.Logger.Infow(logHdr, logArgs...)
+			successGauge.Set(1)
+		} else {
+			f.Logger.Warnw(logHdr, logArgs...)
+			successGauge.Set(0)
+		}
+
+		if ppc.url != "" {
+			if promErr := prometheuspush.New(ppc.url, promStr(currentCmd)).
+				Grouping("instance", promStr(ppc.instance)).
+				BasicAuth(ppc.user, ppc.pass).
+				Collector(tookGauge).
+				Collector(successGauge).
+				Push(); promErr != nil {
+				f.Logger.Warnf("push of prometheus metrics to '%s' failed: %s", ppc.url, promErr)
+			}
+		}
+	}
+	// end BIZARRE
+
+	// a defer to always capture endstate/send a metric, even under panic()s
+	defer func() {
+
+		// a panic condition takes precedence
+		if r := recover(); r != nil {
+			if err == nil {
+				err = fmt.Errorf("panic encountered: %s\n%s", r, debug.Stack())
+			} else {
+				err = fmt.Errorf("panic encountered (in addition to error '%s'): %s\n%s", err, r, debug.Stack())
+			}
+		}
+
+		if err != nil {
+			// if we are not interactive - be quiet on a failed lock
+			if errors.As(err, new(fslock.LockedError)) && !isatty.IsTerminal(os.Stderr.Fd()) {
+				shutdown(true)
+				os.Exit(1)
+			}
+
+			f.Logger.Errorf("%+v", err)
+			if currentCmdLock != nil {
+				emitEndLogs(false)
+			}
+			shutdown(false)
+			os.Exit(1)
+		} else {
+			if currentCmdLock != nil {
+				emitEndLogs(true)
+			}
+			shutdown(true)
+			os.Exit(0)
+		}
+	}()
+
+	startTime = time.Now()
+
+	app := f.AppConfig
+
+	app.Flags = append(app.Flags, baseFlags...)
+	app.Before = func(cctx *cli.Context) error {
+
+		// when using lp2p the first is non-actionable and
+		// the second will fire arbitrarily driven by rand()
+		// there is no value doing so in mainly-CLI setting
+		// https://github.com/libp2p/go-libp2p/blob/master/core/canonicallog/canonicallog.go
+		logging.SetLogLevel("net/identify", "ERROR")  //nolint:errcheck
+		logging.SetLogLevel("canonical-log", "ERROR") //nolint:errcheck
+
+		// pull settings from config file
+		if err := altsrc.InitInputSourceWithContext(
+			f.AppConfig.Flags,
+			func(*cli.Context) (altsrc.InputSourceContext, error) {
+				return altsrc.NewTomlSourceFromFile(f.TOMLPath)
+			},
+		)(cctx); err != nil {
+			return cmn.WrErr(err)
+		}
+
+		// Before() is always called with the *top* cctx in place, not the final one resolved
+		// Figure out what is in os.Args out-of-band
+		{
+			cmdNames := make(map[string]string)
+			for _, c := range cctx.App.Commands {
+				if c.Name == "help" {
+					continue
+				}
+				cmdNames[c.Name] = c.Name
+				for _, a := range c.Aliases {
+					cmdNames[a] = c.Name
+				}
+			}
+
+			// process os.Args even if there are no cmdNames: flush out subcmd help
+			for i := 1; i < len(os.Args); i++ {
+
+				// if we are in help context - no locks and no start/stop timers
+				if os.Args[i] == `-h` || os.Args[i] == `--help` {
+					return nil
+				}
+
+				if currentCmd != "" {
+					continue
+				}
+				currentCmd = cmdNames[os.Args[i]]
+			}
+
+			// not everything has subcommands
+			if len(cmdNames) == 0 {
+				currentCmd = "Action"
+			}
+
+			// wrong cmd or something
+			if currentCmd == "" {
+				return nil
+			}
+		}
+
+		var err error
+		if currentCmdLock, err = fslock.Lock(
+			os.TempDir(),
+			promStr(app.Name)+"-"+promStr(currentCmd), // reuse promstr as path-safe stuff
+		); err != nil {
+			return err // no xerrors wrap on purpose
+		}
+
+		f.Logger.Infow(fmt.Sprintf("=== BEGIN '%s' run", currentCmd))
+
+		if f.GlobalInit != nil {
+			resourcesCloser, err = f.GlobalInit(cctx, f)
+		}
+		return cmn.WrErr(err)
+	}
+
+	// the function ends after this block, err is examined in the defer above
+	// organized in this bizarre way in order to catch panics
+	err = (&app).RunContext(ctx, os.Args)
+}
+
+var nonAlphanumericRun = regexp.MustCompile(`[^a-zA-Z0-9]+`) //nolint:revive
+func promStr(s string) string {
+	return nonAlphanumericRun.ReplaceAllString(s, "_")
+}
