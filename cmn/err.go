@@ -36,7 +36,13 @@ func (e *cmnErr) Unwrap() error              { return e.err }
 func (e *cmnErr) Error() string              { return fmt.Sprint(e) }
 func (e *cmnErr) Format(s fmt.State, v rune) { xerrors.FormatError(e, s, v) }
 func (e *cmnErr) FormatError(p xerrors.Printer) error {
-	p.Print(e.err.Error())
+	if xerr, isXerrFmt := e.err.(xerrors.Formatter); isXerrFmt {
+		// do not return() the next-in-chain error:
+		// the Format below is sufficient to perform implicit depth-first recursion
+		_ = xerr.FormatError(p)
+	} else {
+		p.Print(e.err.Error())
+	}
 	if p.Detail() {
 		e.frame.Format(p)
 	}
