@@ -204,14 +204,16 @@ func (uf *UFcli) RunAndExit(parentCtx context.Context) {
 		logging.SetLogLevel("net/identify", "ERROR")  //nolint:errcheck
 		logging.SetLogLevel("canonical-log", "ERROR") //nolint:errcheck
 
-		// pull settings from config file
-		if err := altsrc.InitInputSourceWithContext(
-			app.Flags,
-			func(*cli.Context) (altsrc.InputSourceContext, error) {
-				return altsrc.NewTomlSourceFromFile(uf.TOMLPath)
-			},
-		)(cctx); err != nil {
-			return cmn.WrErr(err)
+		// pull settings from config file if set
+		if uf.TOMLPath != "" {
+			if err := altsrc.InitInputSourceWithContext(
+				app.Flags,
+				func(*cli.Context) (altsrc.InputSourceContext, error) {
+					return altsrc.NewTomlSourceFromFile(uf.TOMLPath)
+				},
+			)(cctx); err != nil {
+				return cmn.WrErr(err)
+			}
 		}
 
 		promPushConf.url = cctx.String("prometheus_push_url")
