@@ -168,13 +168,13 @@ func (uf *UFcli) RunAndExit(parentCtx context.Context) {
 			}
 
 			uf.Logger.Errorf("%+v", scopeErr)
-			emitEndLogs(false)
 			shutdown(false)
+			emitEndLogs(false)
 			os.Exit(1)
 		}
 
-		emitEndLogs(true)
 		shutdown(true)
+		emitEndLogs(true)
 		os.Exit(0)
 	}()
 
