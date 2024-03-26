@@ -51,6 +51,15 @@ var DefaultHandledSignals = []os.Signal{
 func (uf *UFcli) RunAndExit(parentCtx context.Context) {
 	ctx, topCtxShutdown := context.WithCancel(parentCtx)
 
+	if uf.Logger == nil {
+		name := uf.AppConfig.Name
+		if name == "" {
+			name = "UNNAMED"
+		}
+		uf.Logger = logging.Logger(fmt.Sprintf("%s(PID:%d)", name, os.Getpid()))
+		logging.SetLogLevel("*", "INFO")
+	}
+
 	var resourcesCloser func() error
 	var o sync.Once
 	// called from the defer below
