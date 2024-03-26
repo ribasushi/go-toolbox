@@ -30,12 +30,13 @@ type Logger = *logging.ZapEventLogger // FIXME make it an actual interface
 // handling. It also provides correct init/shutdown hookpoints, and proper
 // locking preventing the same app/command from running more than once.
 type UFcli struct {
-	AppConfig      cli.App                                                                     // stock urfavecli App configuration
-	TOMLPath       string                                                                      // path of TOML config file read via https://pkg.go.dev/github.com/urfave/cli/v2/altsrc
-	GlobalInit     func(cctx *cli.Context, uf *UFcli) (resourceCloser func() error, err error) // optional initialization routines (setup RDBMS pool, etc)
-	BeforeShutdown func() error                                                                // optional function to execute before the top context is cancelled ( unlike resourceCloser above )
-	HandleSignals  []os.Signal                                                                 // if empty defaults to DefaultHandledSignals
-	Logger         Logger
+	AppConfig           cli.App                                                                     // stock urfavecli App configuration
+	TOMLPath            string                                                                      // optional path of TOML config file read via https://pkg.go.dev/github.com/urfave/cli/v2/altsrc
+	AllowConcurrentRuns bool                                                                        // if set allows multiple concurrent runs of the same command
+	GlobalInit          func(cctx *cli.Context, uf *UFcli) (resourceCloser func() error, err error) // optional initialization routines (setup RDBMS pool, etc)
+	BeforeShutdown      func() error                                                                // optional function to execute before the top context is cancelled ( unlike resourceCloser above )
+	HandleSignals       []os.Signal                                                                 // if empty defaults to DefaultHandledSignals
+	Logger              Logger                                                                      // optional ZapEventLogger-compatible object
 }
 
 // nolint:revive
@@ -103,7 +104,7 @@ func (uf *UFcli) RunAndExit(parentCtx context.Context) {
 	)
 	emitEndLogs := func(wasSuccess bool) {
 		// we never managed to grab a lock => we never issued BEGIN => thus no FINISH
-		if currentCmdLock == nil {
+		if !uf.AllowConcurrentRuns && currentCmdLock == nil {
 			return
 		}
 
@@ -162,7 +163,7 @@ func (uf *UFcli) RunAndExit(parentCtx context.Context) {
 
 		if scopeErr != nil {
 			// if we are not interactive - be quiet on a failed lock
-			if errors.As(scopeErr, new(fslock.LockedError)) && !isatty.IsTerminal(os.Stderr.Fd()) {
+			if !uf.AllowConcurrentRuns && errors.As(scopeErr, new(fslock.LockedError)) && !isatty.IsTerminal(os.Stderr.Fd()) {
 				shutdown(true)
 				os.Exit(1)
 			}
@@ -261,11 +262,13 @@ func (uf *UFcli) RunAndExit(parentCtx context.Context) {
 		}
 
 		var err error
-		if currentCmdLock, err = fslock.Lock(
-			os.TempDir(),
-			promStr(app.Name)+"-"+promStr(currentCmd), // reuse promstr as path-safe stuff
-		); err != nil {
-			return err // no xerrors wrap on purpose
+		if !uf.AllowConcurrentRuns {
+			if currentCmdLock, err = fslock.Lock(
+				os.TempDir(),
+				promStr(app.Name)+"-"+promStr(currentCmd), // reuse promstr as path-safe stuff
+			); err != nil {
+				return err // no xerrors wrap on purpose
+			}
 		}
 
 		uf.Logger.Infow(fmt.Sprintf("=== BEGIN '%s' run", currentCmd))
