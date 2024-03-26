@@ -51,15 +51,6 @@ var DefaultHandledSignals = []os.Signal{
 func (uf *UFcli) RunAndExit(parentCtx context.Context) {
 	ctx, topCtxShutdown := context.WithCancel(parentCtx)
 
-	if uf.Logger == nil {
-		name := uf.AppConfig.Name
-		if name == "" {
-			name = "UNNAMED"
-		}
-		uf.Logger = logging.Logger(fmt.Sprintf("%s(PID:%d)", name, os.Getpid()))
-		logging.SetLogLevel("*", "INFO")
-	}
-
 	var resourcesCloser func() error
 	var o sync.Once
 	// called from the defer below
@@ -68,7 +59,7 @@ func (uf *UFcli) RunAndExit(parentCtx context.Context) {
 
 			if uf.BeforeShutdown != nil {
 				if err := uf.BeforeShutdown(); err != nil {
-					uf.Logger.Warnf("error encountered during before-shutdown cleanup: %+v", err)
+					uf.GetLogger().Warnf("error encountered during before-shutdown cleanup: %+v", err)
 				}
 			}
 
@@ -76,7 +67,7 @@ func (uf *UFcli) RunAndExit(parentCtx context.Context) {
 
 			if resourcesCloser != nil {
 				if err := resourcesCloser(); err != nil {
-					uf.Logger.Warnf("error encountered during after-shutdown cleanup: %+v", err)
+					uf.GetLogger().Warnf("error encountered during after-shutdown cleanup: %+v", err)
 				}
 			}
 
@@ -94,7 +85,7 @@ func (uf *UFcli) RunAndExit(parentCtx context.Context) {
 		sigs := make(chan os.Signal, 1)
 		signal.Notify(sigs, handle...)
 		<-sigs
-		uf.Logger.Warn("termination signal received, cleaning up...")
+		uf.GetLogger().Warn("termination signal received, cleaning up...")
 		shutdown(false)
 	}()
 
@@ -136,10 +127,10 @@ func (uf *UFcli) RunAndExit(parentCtx context.Context) {
 		})
 
 		if wasSuccess {
-			uf.Logger.Infow(logHdr, logArgs...)
+			uf.GetLogger().Infow(logHdr, logArgs...)
 			successGauge.Set(1)
 		} else {
-			uf.Logger.Warnw(logHdr, logArgs...)
+			uf.GetLogger().Warnw(logHdr, logArgs...)
 			successGauge.Set(0)
 		}
 
@@ -152,7 +143,7 @@ func (uf *UFcli) RunAndExit(parentCtx context.Context) {
 				p = p.BasicAuth(promPushConf.user, promPushConf.pass)
 			}
 			if promErr := p.Collector(tookGauge).Collector(successGauge).Push(); promErr != nil {
-				uf.Logger.Warnf("push of prometheus metrics to '%s' failed: %s", promPushConf.url, promErr)
+				uf.GetLogger().Warnf("push of prometheus metrics to '%s' failed: %s", promPushConf.url, promErr)
 			}
 		}
 	}
@@ -177,7 +168,7 @@ func (uf *UFcli) RunAndExit(parentCtx context.Context) {
 				os.Exit(1)
 			}
 
-			uf.Logger.Errorf("%+v", scopeErr)
+			uf.GetLogger().Errorf("%+v", scopeErr)
 			shutdown(false)
 			emitEndLogs(false)
 			os.Exit(1)
@@ -280,7 +271,7 @@ func (uf *UFcli) RunAndExit(parentCtx context.Context) {
 			}
 		}
 
-		uf.Logger.Infow(fmt.Sprintf("=== BEGIN '%s' run", currentCmd))
+		uf.GetLogger().Infow(fmt.Sprintf("=== BEGIN '%s' run", currentCmd))
 
 		if uf.GlobalInit != nil {
 			resourcesCloser, err = uf.GlobalInit(cctx, uf)
@@ -291,6 +282,24 @@ func (uf *UFcli) RunAndExit(parentCtx context.Context) {
 	// the function ends after this block, scopeErr is examined in the defer above
 	// organized in this bizarre way in order to catch panics
 	scopeErr = (&app).RunContext(ctx, os.Args)
+}
+
+var globalMutex sync.Mutex
+
+// GetLogger returns the configured Logger object
+func (uf *UFcli) GetLogger() Logger {
+	globalMutex.Lock()
+	defer globalMutex.Unlock()
+
+	if uf.Logger == nil {
+		name := uf.AppConfig.Name
+		if name == "" {
+			name = "UNNAMED"
+		}
+		uf.Logger = logging.Logger(fmt.Sprintf("%s(PID:%d)", name, os.Getpid()))
+		logging.SetLogLevel("*", "INFO")
+	}
+	return uf.Logger
 }
 
 var nonAlphanumericRun = regexp.MustCompile(`[^a-zA-Z0-9]+`) //nolint:revive
