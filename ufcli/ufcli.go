@@ -37,6 +37,9 @@ type UFcli struct {
 	BeforeShutdown      func() error                                                                // optional function to execute before the top context is cancelled ( unlike resourceCloser above )
 	HandleSignals       []os.Signal                                                                 // if empty defaults to DefaultHandledSignals
 	Logger              Logger                                                                      // optional ZapEventLogger-compatible object
+
+	currentCmdLock io.Closer // to hang on to until object destruction
+
 }
 
 // nolint:revive
@@ -91,11 +94,11 @@ func (uf *UFcli) RunAndExit(parentCtx context.Context) {
 
 	// BIZARRE inverted flow because... scoping
 	var (
-		startTime      time.Time
-		scopeErr       error
-		currentCmd     string
-		currentCmdLock io.Closer
-		promPushConf   struct {
+		startTime    time.Time
+		scopeErr     error
+		didBegin     bool
+		currentCmd   string
+		promPushConf struct {
 			url      string
 			user     string
 			pass     string
@@ -103,8 +106,8 @@ func (uf *UFcli) RunAndExit(parentCtx context.Context) {
 		}
 	)
 	emitEndLogs := func(wasSuccess bool) {
-		// we never managed to grab a lock => we never issued BEGIN => thus no FINISH
-		if !uf.AllowConcurrentRuns && currentCmdLock == nil {
+		// no FINISH without BEGIN
+		if !didBegin {
 			return
 		}
 
@@ -227,7 +230,7 @@ func (uf *UFcli) RunAndExit(parentCtx context.Context) {
 		{
 			cmdNames := make(map[string]string)
 			for _, c := range cctx.App.Commands {
-				if c.Name == "help" {
+				if c.Name == "help" || c.Name == "h" {
 					continue
 				}
 				cmdNames[c.Name] = c.Name
@@ -236,7 +239,7 @@ func (uf *UFcli) RunAndExit(parentCtx context.Context) {
 				}
 			}
 
-			// process os.Args even if there are no cmdNames: flush out subcmd help
+			// process os.Args even if there are no cmdNames: need to short-circuit --help/-h
 			for i := 1; i < len(os.Args); i++ {
 
 				// if we are in help context - no locks and no start/stop timers
@@ -263,7 +266,7 @@ func (uf *UFcli) RunAndExit(parentCtx context.Context) {
 
 		var err error
 		if !uf.AllowConcurrentRuns {
-			if currentCmdLock, err = fslock.Lock(
+			if uf.currentCmdLock, err = fslock.Lock(
 				os.TempDir(),
 				promStr(app.Name)+"-"+promStr(currentCmd), // reuse promstr as path-safe stuff
 			); err != nil {
@@ -272,6 +275,7 @@ func (uf *UFcli) RunAndExit(parentCtx context.Context) {
 		}
 
 		uf.GetLogger().Infow(fmt.Sprintf("=== BEGIN '%s' run", currentCmd))
+		didBegin = true
 
 		if uf.GlobalInit != nil {
 			resourcesCloser, err = uf.GlobalInit(cctx, uf)
